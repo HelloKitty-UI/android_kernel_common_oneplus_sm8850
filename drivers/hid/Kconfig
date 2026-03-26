@@ -12,6 +12,12 @@ menuconfig HID_SUPPORT
 
 if HID_SUPPORT
 
+config HID_XPADNEO
+    tristate "Xbox One Wireless Controller (xpadneo)"
+    depends on HID
+    help
+      Advanced Xbox One controller driver with FF support
+
 config HID
 	tristate "HID bus core support"
 	default y
