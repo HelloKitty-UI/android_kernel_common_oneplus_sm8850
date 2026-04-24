@@ -73,12 +73,9 @@ err:
 	return NULL;
 }
 
-/* Caller must hold sb->mutex */
 static void
 __xhci_sideband_remove_endpoint(struct xhci_sideband *sb, struct xhci_virt_ep *ep)
 {
-	lockdep_assert_held(&sb->mutex);
-
 	/*
 	 * Issue a stop endpoint command when an endpoint is removed.
 	 * The stop ep cmd handler will handle the ring cleanup.
@@ -87,19 +84,6 @@ __xhci_sideband_remove_endpoint(struct xhci_sideband *sb, struct xhci_virt_ep *e
 
 	ep->sideband = NULL;
 	sb->eps[ep->ep_index] = NULL;
-}
-
-/* Caller must hold sb->mutex */
-static void
-__xhci_sideband_remove_interrupter(struct xhci_sideband *sb)
-{
-	lockdep_assert_held(&sb->mutex);
-
-	if (!sb->ir)
-		return;
-
-	xhci_remove_secondary_interrupter(xhci_to_hcd(sb->xhci), sb->ir);
-	sb->ir = NULL;
 }
 
 /* sideband api functions */
@@ -147,16 +131,14 @@ xhci_sideband_add_endpoint(struct xhci_sideband *sb,
 	struct xhci_virt_ep *ep;
 	unsigned int ep_index;
 
-	guard(mutex)(&sb->mutex);
-
-	if (!sb->vdev)
-		return -ENODEV;
-
+	mutex_lock(&sb->mutex);
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = &sb->vdev->eps[ep_index];
 
-	if (ep->ep_state & EP_HAS_STREAMS)
+	if (ep->ep_state & EP_HAS_STREAMS) {
+		mutex_unlock(&sb->mutex);
 		return -EINVAL;
+	}
 
 	/*
 	 * Note, we don't know the DMA mask of the audio DSP device, if its
@@ -166,11 +148,14 @@ xhci_sideband_add_endpoint(struct xhci_sideband *sb,
 	 * and let this function add the endpoint and allocate the ring buffer
 	 * with the smallest common DMA mask
 	 */
-	if (sb->eps[ep_index] || ep->sideband)
+	if (sb->eps[ep_index] || ep->sideband) {
+		mutex_unlock(&sb->mutex);
 		return -EBUSY;
+	}
 
 	ep->sideband = sb;
 	sb->eps[ep_index] = ep;
+	mutex_unlock(&sb->mutex);
 
 	return 0;
 }
@@ -195,16 +180,18 @@ xhci_sideband_remove_endpoint(struct xhci_sideband *sb,
 	struct xhci_virt_ep *ep;
 	unsigned int ep_index;
 
-	guard(mutex)(&sb->mutex);
-
+	mutex_lock(&sb->mutex);
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = sb->eps[ep_index];
 
-	if (!ep || !ep->sideband || ep->sideband != sb)
+	if (!ep || !ep->sideband || ep->sideband != sb) {
+		mutex_unlock(&sb->mutex);
 		return -ENODEV;
+	}
 
 	__xhci_sideband_remove_endpoint(sb, ep);
 	xhci_initialize_ring_info(ep->ring);
+	mutex_unlock(&sb->mutex);
 
 	return 0;
 }
@@ -303,21 +290,24 @@ xhci_sideband_create_interrupter(struct xhci_sideband *sb, int num_seg,
 	if (!sb || !sb->xhci)
 		return -ENODEV;
 
-	guard(mutex)(&sb->mutex);
-
-	if (!sb->vdev)
-		return -ENODEV;
-
-	if (sb->ir)
-		return -EBUSY;
+	mutex_lock(&sb->mutex);
+	if (sb->ir) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	sb->ir = xhci_create_secondary_interrupter(xhci_to_hcd(sb->xhci),
 						   num_seg, imod_interval,
 						   intr_num);
-	if (!sb->ir)
-		return -ENOMEM;
+	if (!sb->ir) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	sb->ir->ip_autoclear = ip_autoclear;
+
+out:
+	mutex_unlock(&sb->mutex);
 
 	return ret;
 }
@@ -333,12 +323,14 @@ EXPORT_SYMBOL_GPL(xhci_sideband_create_interrupter);
 void
 xhci_sideband_remove_interrupter(struct xhci_sideband *sb)
 {
-	if (!sb)
+	if (!sb || !sb->ir)
 		return;
 
-	guard(mutex)(&sb->mutex);
+	mutex_lock(&sb->mutex);
+	xhci_remove_secondary_interrupter(xhci_to_hcd(sb->xhci), sb->ir);
 
-	__xhci_sideband_remove_interrupter(sb);
+	sb->ir = NULL;
+	mutex_unlock(&sb->mutex);
 }
 EXPORT_SYMBOL_GPL(xhci_sideband_remove_interrupter);
 
@@ -437,7 +429,6 @@ EXPORT_SYMBOL_GPL(xhci_sideband_register);
 void
 xhci_sideband_unregister(struct xhci_sideband *sb)
 {
-	struct xhci_virt_device *vdev;
 	struct xhci_hcd *xhci;
 	int i;
 
@@ -446,23 +437,17 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 
 	xhci = sb->xhci;
 
-	scoped_guard(mutex, &sb->mutex) {
-		vdev = sb->vdev;
-		if (!vdev)
-			return;
+	mutex_lock(&sb->mutex);
+	for (i = 0; i < EP_CTX_PER_DEV; i++)
+		if (sb->eps[i])
+			__xhci_sideband_remove_endpoint(sb, sb->eps[i]);
+	mutex_unlock(&sb->mutex);
 
-		for (i = 0; i < EP_CTX_PER_DEV; i++)
-			if (sb->eps[i])
-				__xhci_sideband_remove_endpoint(sb, sb->eps[i]);
-
-		__xhci_sideband_remove_interrupter(sb);
-
-		sb->vdev = NULL;
-	}
+	xhci_sideband_remove_interrupter(sb);
 
 	spin_lock_irq(&xhci->lock);
 	sb->xhci = NULL;
-	vdev->sideband = NULL;
+	sb->vdev->sideband = NULL;
 	spin_unlock_irq(&xhci->lock);
 
 	kfree(sb);
